@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 #By Abel Thomas
 
 filesdir=$1
