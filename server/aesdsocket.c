@@ -89,9 +89,9 @@ int socket_handler(int connFd, int logFd, int bytesReturned){
 	bool packetsCompleted = false;
 	bool newlinefound = false;
 	int bytesRecv = 0;
-	int count = 1;
-	char * recvBuff = (char *)malloc(BUFFER_SIZE * sizeof(char));
-
+	//int count = 1;
+	//char * recvBuff = (char *)malloc(BUFFER_SIZE * sizeof(char));
+	char recvBuff[BUFFER_SIZE];
 
 	//read while there are still packets to be recieved
 	while(!packetsCompleted){
@@ -112,12 +112,12 @@ int socket_handler(int connFd, int logFd, int bytesReturned){
 		}
 		
 		//grow array if need be by multiple of counter
-		if (bytesReturned + bytesRecv >= BUFFER_SIZE * count * sizeof(char)){
-			count++;
-			char * temp = (char *)realloc(recvBuff, BUFFER_SIZE * count * sizeof(char));
-			recvBuff = NULL;
-			recvBuff = temp;
-		}
+		//if (bytesReturned + bytesRecv >= BUFFER_SIZE * count * sizeof(char)){
+			//count++;
+			//char * temp = (char *)realloc(recvBuff, BUFFER_SIZE * count * sizeof(char));
+			//recvBuff = NULL;
+			//recvBuff = temp;
+		//}
 
 		//track bytes received
 		bytesReturned += bytesRecv;
@@ -154,7 +154,7 @@ int socket_handler(int connFd, int logFd, int bytesReturned){
 		}
 	}
 	
-	free(recvBuff);
+	//free(recvBuff);
 
 	//return total bytes read/sent
 	return bytesReturned;
