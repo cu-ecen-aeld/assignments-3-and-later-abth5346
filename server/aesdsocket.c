@@ -17,18 +17,46 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#include <pthread.h>
+#include <time.h>
+#include "queue.h"
 
 #define PORT_NUM "9000"
 #define BACKLOG_QUEUE 10     
 #define LOG_FILE_PATH "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
+#define TIME_BUFFER_SIZE 100
+#define SLEEP_TIME_S 10
 
+//global defs
 bool sig_caught = false;
+int sockfd;
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+//linked list head decloration
+SLIST_HEAD( ThreadHead, ThreadParams ) threadHead;
+
+//thread parameter struct
+struct ThreadParams
+{
+    pthread_t threadId;
+    bool threadDone;
+
+    //hold unique client fd
+    int connFd;
+    
+    SLIST_ENTRY( ThreadParams ) entries;
+};
+
+
 
 //signal handler
 static void signal_handler(int signal_number){
-	sig_caught = true;
-	syslog(LOG_DEBUG, "Singal caught");
+	if (signal_number == SIGINT || signal_number == SIGTERM){
+		sig_caught = true;
+		syslog(LOG_DEBUG, "Singal caught");
+	}
 }
 
 //initialize signals to catch
@@ -84,106 +112,172 @@ static int init_socket(){
 }
 
 //socket server task
-int socket_handler(int connFd, int logFd, int bytesReturned){
+void *socket_handler ( void *arg )
+{
 
-	bool packetsCompleted = false;
+    FILE *logFd;
+    struct ThreadParams *threadP = (struct ThreadParams *) arg;
+    int connFd = threadP->connFd;
+    
+    bool packetsCompleted = false;
 	bool newlinefound = false;
-	int bytesRecv = 0;
-	//int count = 1;
-	//char * recvBuff = (char *)malloc(BUFFER_SIZE * sizeof(char));
-	char recvBuff[BUFFER_SIZE];
+    ssize_t bytesRecv;
 
-	//read while there are still packets to be recieved
-	while(!packetsCompleted){
+    char recvBuff[BUFFER_SIZE];
 
-		//recevied packets from client
-		bytesRecv = recv(connFd, recvBuff, sizeof(recvBuff), 0);
-		
-		//newline char recieved
-		if (strchr(recvBuff, '\n') != NULL){
-			packetsCompleted = true;
-			newlinefound = true;
-		}
+    //read while there are still packets to be recieved
+    while (!packetsCompleted)
+    {
+        pthread_mutex_lock(&mutex);
 
-		//no more bytes to be recieved
-		if(bytesRecv <= 0){
-			packetsCompleted = true;
+        //recevied packets from client until no more bytes to be recieved
+        if ((bytesRecv += recv(connFd, recvBuff, sizeof(recvBuff), 0)) <= 0){
+            packetsCompleted = true;
 			break;
-		}
-		
-		//grow array if need be by multiple of counter
-		//if (bytesReturned + bytesRecv >= BUFFER_SIZE * count * sizeof(char)){
-			//count++;
-			//char * temp = (char *)realloc(recvBuff, BUFFER_SIZE * count * sizeof(char));
-			//recvBuff = NULL;
-			//recvBuff = temp;
-		//}
+        }
 
-		//track bytes received
-		bytesReturned += bytesRecv;
-	
-		//move file pointer to end to append and append buffer from client to file
-		lseek(logFd, 0, SEEK_END);
-		int bytesToWrite = write(logFd, &recvBuff, bytesRecv);
+        int bytesRecvApp = bytesRecv;
 
-		if (bytesToWrite <= 0){
-			syslog(LOG_ERR, "Error, could not write to file");
-			return(-1);
-		} 
-		else if (bytesToWrite < bytesRecv){
-			syslog(LOG_ERR, "Error, incomplete write to file");
-			return(-1);
-		}
+        //open log file to append
+        logFd = fopen(LOG_FILE_PATH, "a");
+        if (logFd == NULL){
+            syslog(LOG_ERR, "Error could not write to file");
+            pthread_mutex_unlock(&mutex);
+            threadP->threadDone = true;
+            close(connFd);
+            pthread_exit(NULL);
+        }
 
-	}
-	
-	char sendBuff[bytesReturned];
+        //write to log file
+        fwrite(recvBuff, sizeof(recvBuff[0]), bytesRecvApp, logFd);
+        fclose(logFd);
 
-	//if new line is found read back data to client
-	if (newlinefound == true){
-		//reset file pointer to start to send entire file and copy file contents
-		lseek(logFd, 0, SEEK_SET);
-		int bytesToRead = read(logFd, &sendBuff, bytesReturned);
+        //newline char recieved
+        if (strchr(recvBuff, '\n') != NULL){
+            packetsCompleted = true;
+            newlinefound = true;
+        }
 
-		//send file contents to client
-		int bytesSent = send(connFd, &sendBuff, bytesToRead, 0);
-		
-		if (bytesToRead != bytesSent) {
-			syslog(LOG_ERR, "Error sending data back to client");
-			return(-1);
-		}
-	}
-	
-	//free(recvBuff);
+        pthread_mutex_unlock(&mutex);
+    }
 
-	//return total bytes read/sent
-	return bytesReturned;
+
+    //if new line is found read back data to client
+    if(newlinefound){
+
+        pthread_mutex_lock(&mutex);
+        //open file to read only
+        logFd = fopen(LOG_FILE_PATH, "r");
+        if (logFd == NULL)
+        {
+            syslog(LOG_ERR, "Error could not write to file");
+            pthread_mutex_unlock(&mutex);
+            threadP->threadDone = true;
+            close(connFd);
+            pthread_exit(NULL);
+        }
+
+        int bytesSent = 0;
+
+        //send file contents to client
+        while ((bytesRecv = fread(recvBuff, sizeof(recvBuff[0]), sizeof( recvBuff ), logFd)) > 0)
+        {
+            bytesSent += send(connFd, recvBuff, bytesRecv, 0);
+        }
+
+        //make sure bytes sent and recived are the same
+        if(bytesRecv != bytesSent){
+            syslog(LOG_ERR, "Error sending data back to client");
+            pthread_mutex_unlock(&mutex);
+            threadP->threadDone = true;
+            close(connFd);
+            pthread_exit(NULL);
+        }
+
+        fclose(logFd);
+
+        pthread_mutex_unlock(&mutex);
+    }
+    
+    threadP->threadDone = true;
+
+    //close client connection and exit
+    close(connFd);
+    pthread_exit(NULL);
 }
 
-int main(int argc, char** argv){
+void *appendTimestamp (void *arg){
+    FILE *logFd;
 
+    char timestamp[TIME_BUFFER_SIZE];
+    struct timespec sleepDuration = {SLEEP_TIME_S, 0}; 
 
-	int sockfd;
-	int bytesReturned = 0;
+    struct timespec currTime;
+    struct tm timeStuct;
 
+    while (!sig_caught)
+    {
+        //get current time to closest ns
+        if (clock_gettime(CLOCK_REALTIME, &currTime) == -1)
+        {
+            syslog(LOG_ERR, "Could not recieve current time");
+            pthread_exit(NULL);
+        }
+
+        //convert from timespec to time struct
+        localtime_r(&currTime.tv_sec, &timeStuct);
+
+        //format to valid timestamp string
+        strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %T %z", &timeStuct);
+
+        pthread_mutex_lock(&mutex);
+        
+        //open log file to append
+        logFd = fopen(LOG_FILE_PATH, "a");
+        if ( logFd == NULL )
+        {
+            syslog(LOG_ERR, "Error could not write to file");
+            pthread_mutex_unlock( &mutex );
+            pthread_exit( NULL );
+        }
+
+        //add new line as last char
+        size_t length = strlen(timestamp) + 1;
+		timestamp[length -1] = '\n';
+
+        // Write the timestamp to the file
+        if (fwrite(timestamp, 1, length, logFd) != length)
+        {
+            syslog(LOG_ERR, "Error could not write to file");
+            fclose(logFd);
+            pthread_mutex_unlock(&mutex);
+            pthread_exit(NULL);
+        }
+
+        fclose(logFd);
+        pthread_mutex_unlock(&mutex);
+
+        //sleep for 10 sec
+        nanosleep(&sleepDuration, NULL);
+    }
+
+    return 0;
+}
+
+// Main function
+int main ( int argc, char *argv[] )
+{
 	//open syslog
 	openlog (NULL, 0, LOG_USER);
 
 	//create and setup socket
 	if((sockfd = init_socket()) == -1){
 		syslog(LOG_ERR, "Could not setup server socket");
-		return -1;
+        closelog();
+        exit(-1);
 	}
 
-	//open log to write client to
-	int logFd = open(LOG_FILE_PATH, O_RDWR | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO);
-	if (logFd == -1) 
-	{
-		syslog(LOG_ERR, "Error: (%s) while opening %s", strerror(errno), LOG_FILE_PATH);
-		return(-1);
-	}
-	
-	//enter daemon mode if specified
+ 	//enter daemon mode if specified
 	//https://stackoverflow.com/questions/5384168/how-to-make-a-daemon-process
 	if(argc > 1){
 		if(strcmp(argv[1], "-d") == 0){
@@ -193,28 +287,39 @@ int main(int argc, char** argv){
 		}
 	}
 
-	//map signals needed to terminate gracefully
+    //map signals needed to terminate gracefully
 	init_signals();
 
 	//listen for client connections
 	if(listen(sockfd, BACKLOG_QUEUE) != 0){
 		syslog(LOG_ERR, "Could listen for client: %s\n", strerror(errno));
-		exit(-1);
+        closelog();
+        exit(-1);
 	}
 
-	bool read_error = false;
+    //initializte linked list
+    SLIST_INIT(&threadHead);
 
-	//while signal or client read error is not found
-	while(!sig_caught && !read_error){
-		
-		//wait for connection
+    //create and spawn thread for timestamping
+    pthread_t timestampThread;
+    if (pthread_create( &timestampThread, NULL, appendTimestamp, NULL ) != 0)
+    {
+        syslog(LOG_ERR, "Could not spawn timestamping thread");
+        closelog();
+        exit(-1);
+    }
+
+    while (!sig_caught)
+    {
+        //wait for connection
 		struct sockaddr_storage connAddr;
 	  	socklen_t addrLen = sizeof(connAddr);
 	    int connFd = accept(sockfd, (struct sockaddr *)&connAddr, &addrLen);
-		
-		if (connFd < 0){
+
+        if (connFd < 0){
 			syslog(LOG_ERR, "Error accepting connection on socket with error: %s", strerror(errno));
-			exit(-1);
+			close(connFd);
+            continue;
 		}
 
 		//print out connection IP address
@@ -222,25 +327,45 @@ int main(int argc, char** argv){
 		inet_ntop(connAddr.ss_family, &(((struct sockaddr_in *)&connAddr)->sin_addr), addrStr, sizeof(connAddr));
 		syslog(LOG_DEBUG, "Accepted connection from %s", addrStr);
 
-		//socket read operation to read from client and send back based on total number of bytes tracked
-		if((bytesReturned = socket_handler(connFd, logFd, bytesReturned)) == -1){
-			syslog(LOG_ERR, "Error could execute socket handler");
-			read_error = true;
-		}
+        //create new client conn thread
+        struct ThreadParams *threadP = (struct ThreadParams *)malloc(sizeof(struct ThreadParams));
+        threadP->connFd = connFd;
+        threadP->threadDone = false;
+        //create client connection thread
+        if ( pthread_create( &threadP->threadId, NULL, socket_handler, threadP ) != 0 ){
+            close(connFd);
+            free(threadP);
+            continue;
+        }
 
-	}
+        //insert thread at head to list
+        SLIST_INSERT_HEAD(&threadHead, threadP, entries);
 
-	//cleanup process
-	closelog();
-	
-	close(logFd);
+        //loop through thread entries and join thread
+        struct ThreadParams *currThread, *nxtThread;
+        SLIST_FOREACH_SAFE(currThread, &threadHead, entries, nxtThread){
+            if (currThread->threadDone){
+                pthread_join(currThread->threadId, NULL);
+                SLIST_REMOVE(&threadHead, currThread, ThreadParams, entries);
+                free(currThread);
+            }
+        }
+    }
+
+    pthread_cancel(timestampThread);
+
+    struct ThreadParams *currThread, *nxtThread;
+    SLIST_FOREACH_SAFE(currThread, &threadHead, entries, nxtThread){
+        pthread_join(currThread->threadId, NULL);
+        SLIST_REMOVE(&threadHead, currThread, ThreadParams, entries);
+        free(currThread);
+    }
+
+    pthread_mutex_destroy(&mutex);
+
+    closelog();
 	remove(LOG_FILE_PATH);
-	
 	shutdown(sockfd, SHUT_RDWR);
-	close(sockfd);
 
-	if(read_error) return -1;
-
-	return 0;	
-
+    return 0;
 }
