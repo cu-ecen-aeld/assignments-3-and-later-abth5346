@@ -23,10 +23,17 @@
 
 #define PORT_NUM "9000"
 #define BACKLOG_QUEUE 10     
-#define LOG_FILE_PATH "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
 #define TIME_BUFFER_SIZE 100
 #define SLEEP_TIME_S 10
+
+#define USE_AESD_CHAR_DEVICE 0
+
+#if USE_AESD_CHAR_DEVICE
+    #define LOG_FILE_PATH "/dev/aesdchar"
+#else
+    #define LOG_FILE_PATH "/var/tmp/aesdsocketdata"
+#endif
 
 //global defs
 bool sig_caught = false;
@@ -269,7 +276,7 @@ int main ( int argc, char *argv[] )
 {
 	//open syslog
 	openlog (NULL, 0, LOG_USER);
-
+    
 	//create and setup socket
 	if((sockfd = init_socket()) == -1){
 		syslog(LOG_ERR, "Could not setup server socket");
@@ -300,6 +307,7 @@ int main ( int argc, char *argv[] )
     //initializte linked list
     SLIST_INIT(&threadHead);
 
+#if (USE_AESD_CHAR_DEVICE == 0)
     //create and spawn thread for timestamping
     pthread_t timestampThread;
     if (pthread_create( &timestampThread, NULL, appendTimestamp, NULL ) != 0)
@@ -308,7 +316,7 @@ int main ( int argc, char *argv[] )
         closelog();
         exit(-1);
     }
-
+#endif
     while (!sig_caught)
     {
         //wait for connection
@@ -351,8 +359,10 @@ int main ( int argc, char *argv[] )
             }
         }
     }
-
+    
+#if (USE_AESD_CHAR_DEVICE == 0)
     pthread_cancel(timestampThread);
+#endif
 
     struct ThreadParams *currThread, *nxtThread;
     SLIST_FOREACH_SAFE(currThread, &threadHead, entries, nxtThread){
@@ -364,8 +374,8 @@ int main ( int argc, char *argv[] )
     pthread_mutex_destroy(&mutex);
 
     closelog();
-	remove(LOG_FILE_PATH);
-	shutdown(sockfd, SHUT_RDWR);
+    remove(LOG_FILE_PATH);
+    shutdown(sockfd, SHUT_RDWR);
 
     return 0;
 }
